@@ -1,3 +1,9 @@
+#include <Preferences.h>
+Preferences preferences;
+
+#include <ArduinoJson.h>
+#include <ArduinoJson.hpp>
+
 /*
 TODO:
 - preflight for distance ranges
@@ -13,6 +19,7 @@ TODO:
 #include <wm_consts_en.h>
 #include <wm_strings_en.h>
 #include <wm_strings_es.h>
+#include <HTTPClient.h>
 
 #include <esp_task_wdt.h>
 
@@ -26,6 +33,13 @@ WiFiClient espClient;
 #include <Adafruit_NeoMatrix.h>
 #include <Adafruit_NeoPixel.h>
 //include <Fonts/Picopixel.h>
+#include "FreeMono9pt7b.h"
+
+unsigned long lastOLEDUpdate = 0;
+unsigned long lastOffsetUpdate = 0;
+int distance_offsets[] = {60, 90, 120, 150};
+
+#define OFFSET_CONFIG_URL "http://192.168.1.2/flask/garage/config"
 
 #define LED_PIN 27
 #define LED_COLS 32
@@ -48,7 +62,6 @@ int ultrasonic_distance_int;
 char ultrasonic_distance_str[10];
 int ultrasonic_distance_quantized;
 unsigned long lastBigChange = 0;
-
 
 // LilyGo ESP32 w/ OLED--nice, but not the only thing I run this code on
 #define ENABLE_OLED_DISPLAY
@@ -138,11 +151,14 @@ unsigned long lastBigChange = 0;
       tft.println();
     }
 
-    tft.setCursor(0, 80);
     tft.setTextColor(ST77XX_WHITE, ST77XX_BLACK);
-    tft.print("DISTANCE ");
-    tft.print(ultrasonic_distance_str);
-    tft.println("cm                 ");
+    tft.print(distance_offsets[0]);
+    tft.print("/");
+    tft.print(distance_offsets[1]);
+    tft.print("/");
+    tft.print(distance_offsets[2]);
+    tft.print("/");
+    tft.println(distance_offsets[3]);
   }
 #else
   void setupDisplay() { return; }
@@ -157,7 +173,7 @@ void setup() {
   matrix.setTextWrap(false);
   matrix.setBrightness(5);
   matrix.setTextColor(matrix.Color(0, 255, 0));
-  // matrix.setFont(&Picopixel);
+  matrix.setFont(&FreeMono9pt7b);
 
   // set MQTT ID
   uint64_t chipid = ESP.getEfuseMac(); // The chip ID is essentially its MAC address(length: 6 bytes).
@@ -180,6 +196,13 @@ void setup() {
   mqtt_client.setServer(MQTT_SERVER, MQTT_SERVERPORT);
   mqtt_client.setCallback(mqtt_callback);
   connect_mqtt();
+
+  // read EEPROM offsets
+  preferences.begin("garage", false);
+  distance_offsets[0] = preferences.getInt("dist0", 60);
+  distance_offsets[1] = preferences.getInt("dist1", 90);
+  distance_offsets[2] = preferences.getInt("dist2", 120);
+  distance_offsets[3] = preferences.getInt("dist3", 150);
 }
 
 void loop() {
@@ -196,15 +219,67 @@ void loop() {
 
   // only keep the matrix turned on for 120s after a major distance change is detected
   if ((millis() - lastBigChange) < 120000) {
-    refreshMatrix();
+    matrixActive = true;
   }
   else if (matrixActive) {
     disableMatrix();
   }
 
-  refreshDisplay();
+  if ((!matrixActive) || (millis() - lastOLEDUpdate > 15000)) {
+    refreshDisplay();
+    lastOLEDUpdate = millis();
+  }
+
+  if ((millis() > 5000) && ((lastOffsetUpdate == 0) || (millis() - lastOffsetUpdate > 60000))) { // check offset config 1x/minute
+    updateOffsets();
+    lastOffsetUpdate = millis();
+  }
+
   publishDistanceMQTT();
-  delay(50);
+}
+
+void updateOffsets() {
+  Serial.println("attempting to update offsets");
+  if (WiFi.status() == 3) {
+
+    HTTPClient http;
+    http.begin(OFFSET_CONFIG_URL);
+    
+    int httpResponseCode = http.GET();
+    
+    if (httpResponseCode>0) {
+      Serial.print("HTTP Response code: ");
+      Serial.println(httpResponseCode);
+
+      DynamicJsonDocument doc(1024);
+      deserializeJson(doc, http.getString().c_str());
+      for(int i=0; i<4; i++) {
+        distance_offsets[i] = doc[i];
+        Serial.print("distance offset ");
+        Serial.print(i);
+        Serial.print(": ");
+        Serial.println(distance_offsets[i]);
+
+        char prefkey[20] = "dist";
+        char offset[2];
+        itoa(i, offset, 10);
+        strcat(prefkey, offset);
+        if (preferences.getInt(prefkey) != distance_offsets[i]) {
+          Serial.print("putting offset ");
+          Serial.print(distance_offsets[i]);
+          Serial.print(" into preference ");
+          Serial.println(prefkey);
+          preferences.putInt(prefkey, distance_offsets[i]);
+        } 
+      }
+    }
+    else {
+      Serial.print("HTTP error code: ");
+      Serial.println(httpResponseCode);
+    }
+    // Free resources
+    http.end();
+  }
 }
 
 void publishDistanceMQTT() {
@@ -235,6 +310,21 @@ bool readDistance() {
   }
   ultrasonic_distance_quantized = ultrasonic_distance_int / 10;
   itoa(ultrasonic_distance_int, ultrasonic_distance_str, 10);
+
+  if (matrixActive) {
+    refreshMatrix();
+  }
+
+  int16_t  x1, y1;
+  uint16_t w, h;
+  tft.getTextBounds(ultrasonic_distance_str, 0, 0, &x1, &y1, &w, &h);
+  tft.setCursor(0, tft.height() - h);
+  tft.setTextColor(ST77XX_WHITE, ST77XX_BLACK);
+  tft.print("DISTANCE ");
+  tft.setTextColor(getCorrectColor(), ST77XX_BLACK);
+  tft.print(ultrasonic_distance_str);
+  tft.println("cm                 ");
+
   return out;
 }
 
@@ -244,10 +334,55 @@ void disableMatrix() {
   matrix.show();
 }
 
+uint16_t getCorrectColor() {
+  const uint16_t colors[] = {
+    matrix.Color(255, 0, 0), matrix.Color(255, 255, 0), matrix.Color(0, 255, 0), matrix.Color(255, 255, 0), matrix.Color(255, 0, 0)
+  };
+  int correctColor = 0;
+  for(int i=0; i<4; i++) {
+    if (ultrasonic_distance_int > distance_offsets[i]) {
+      correctColor++;
+    }
+  }
+  return colors[correctColor];
+}
+
 void refreshMatrix() {
-  matrixActive = true;
   matrix.fillScreen(0);    //Turn off all the LEDs
-  matrix.setCursor(LED_COLS / 2, 0);
+  
+  // determine color based on distance
+  matrix.setTextColor(getCorrectColor());
+
+  int16_t  x1, y1;
+  uint16_t w, h;
+  matrix.getTextBounds(ultrasonic_distance_str, 0, LED_ROWS-1, &x1, &y1, &w, &h);
+  matrix.setCursor((LED_COLS - w) / 2, LED_ROWS - 1);
   matrix.print(ultrasonic_distance_str);
+  
   matrix.show();
+}
+
+String httpGETRequest(const char* serverName) {
+  HTTPClient http;
+    
+  // Your Domain name with URL path or IP address with path
+  http.begin(serverName);
+  
+  int httpResponseCode = http.GET();
+  
+  String payload = "{}"; 
+  
+  if (httpResponseCode>0) {
+    Serial.print("HTTP Response code: ");
+    Serial.println(httpResponseCode);
+    payload = http.getString();
+  }
+  else {
+    Serial.print("Error code: ");
+    Serial.println(httpResponseCode);
+  }
+  // Free resources
+  http.end();
+
+  return payload;
 }
